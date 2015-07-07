@@ -1,6 +1,6 @@
 /*
  Parson ( http://kgabis.github.com/parson/ )
- Copyright (c) 2012 - 2014 Krzysztof Gabis
+ Copyright (c) 2012 - 2015 Krzysztof Gabis
 
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal
@@ -49,9 +49,6 @@
 static JSON_Malloc_Function parson_malloc = malloc;
 static JSON_Free_Function parson_free = free;
 
-#define PRINT_AND_SKIP(str, to_append) str += sprintf(str, to_append);
-#define PRINTF_AND_SKIP(str, format, to_append) str += sprintf(str, format, to_append);
-
 #define IS_CONT(b) (((unsigned char)(b) & 0xC0) == 0x80) /* is utf-8 continuation byte */
 
 /* Type definitions */
@@ -92,7 +89,6 @@ static int    num_bytes_in_utf8_sequence(unsigned char c);
 static int    verify_utf8_sequence(const unsigned char *string, int *len);
 static int    is_valid_utf8(const char *string, size_t string_len);
 static int    is_decimal(const char *string, size_t length);
-static size_t serialization_strlen(const char *string);
 
 /* JSON Object */
 static JSON_Object * json_object_init(void);
@@ -124,9 +120,10 @@ static JSON_Value * parse_null_value(const char **string);
 static JSON_Value * parse_value(const char **string, size_t nesting);
 
 /* Serialization */
-static size_t json_serialization_size_r(const JSON_Value *value, char *buf);
-static char * json_serialize_to_buffer_r(const JSON_Value *value, char *buf);
-static char * json_serialize_string(const char *string, char *buf);
+static int    json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int level, int is_pretty, char *num_buf);
+static int    json_serialize_string(const char *string, char *buf);
+static int    append_indent(char *buf, int level);
+static int    append_string(char *buf, const char *string);
 
 /* Various */
 static char * parson_strndup(const char *string, size_t n) {
@@ -224,18 +221,6 @@ static int is_decimal(const char *string, size_t length) {
         if (strchr("xX", string[length]))
             return 0;
     return 1;
-}
-
-static size_t serialization_strlen(const char *string) {
-    size_t result = 0;
-    size_t i = 0, len = strlen(string);
-    for (i = 0; i < len; i++) {
-        if (strchr("\"\\\b\f\n\r\t", string[i])) /* must be escaped */
-            result += 2;
-        else
-            result += 1;
-    }
-    return result;
 }
 
 static char * read_file(const char * filename) {
@@ -727,60 +712,17 @@ static JSON_Value * parse_null_value(const char **string) {
 }
 
 /* Serialization */
-static size_t json_serialization_size_r(const JSON_Value *value, char *buf) {
-    size_t result_size = 0;
-    const char *key = NULL;
-    JSON_Value *temp_value = NULL;
-    JSON_Array *array = NULL;
-    JSON_Object *object = NULL;
-    size_t i = 0, count = 0;
-    double num = 0.0;
-    switch (json_value_get_type(value)) {
-        case JSONArray:
-            array = json_value_get_array(value);
-            count = json_array_get_count(array);
-            result_size += 2; /* [ and ] brackets */
-            if (count > 0)
-                result_size += count - 1; /* , between items */
-            for (i = 0; i < count; i++) {
-                temp_value = json_array_get_value(array, i);
-                result_size += json_serialization_size_r(temp_value, buf);
-            }
-            return result_size;
-        case JSONObject:
-            object = json_value_get_object(value);
-            count  = json_object_get_count(object);
-            result_size += 2; /* { and } brackets */
-            if (count > 0)
-                result_size += (count * 2) - 1; /* : between keys and values and , between items */
-            for (i = 0; i < count; i++) {
-                key = json_object_get_name(object, i);
-                result_size += serialization_strlen(key) + 2; /* string and quotes */
-                result_size += json_serialization_size_r(json_object_get_value(object, key), buf);
-            }
-            return result_size;
-        case JSONString:
-            return serialization_strlen(json_value_get_string(value)) + 2; /* string and quotes */
-        case JSONBoolean:
-            if (json_value_get_boolean(value))
-                return 4; /* strlen("true"); */
-            else
-                return 5; /* strlen("false"); */
-        case JSONNumber:
-            num = json_value_get_number(value);
-            if (num == ((double)(int)num) ) /*  check if num is integer */
-                return (size_t)sprintf(buf, "%d", (int)num);
-            return (size_t)sprintf(buf, DOUBLE_SERIALIZATION_FORMAT, num);
-        case JSONNull:
-            return 4; /* strlen("null"); */
-        case JSONError:
-            return 0;
-        default:
-            return 0;
-    }
-}
+#define APPEND_STRING(str) do { written = append_string(buf, (str)); \
+                                if (written < 0) { return -1; } \
+                                if (buf != NULL) { buf += written; } \
+                                written_total += written; } while(0)
 
-char* json_serialize_to_buffer_r(const JSON_Value *value, char *buf)
+#define APPEND_INDENT(level) do { written = append_indent(buf, (level)); \
+                                  if (written < 0) { return -1; } \
+                                  if (buf != NULL) { buf += written; } \
+                                  written_total += written; } while(0)
+
+static int json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int level, int is_pretty, char *num_buf)
 {
     const char *key = NULL, *string = NULL;
     JSON_Value *temp_value = NULL;
@@ -788,89 +730,154 @@ char* json_serialize_to_buffer_r(const JSON_Value *value, char *buf)
     JSON_Object *object = NULL;
     size_t i = 0, count = 0;
     double num = 0.0;
+    int written = -1, written_total = 0;
+    
     switch (json_value_get_type(value)) {
         case JSONArray:
             array = json_value_get_array(value);
             count = json_array_get_count(array);
-            PRINT_AND_SKIP(buf, "[");
+            APPEND_STRING("[");
+            if (count > 0 && is_pretty)
+                APPEND_STRING("\n");
             for (i = 0; i < count; i++) {
+                if (is_pretty)
+                    APPEND_INDENT(level+1);
                 temp_value = json_array_get_value(array, i);
-                buf = json_serialize_to_buffer_r(temp_value, buf);
-                if (buf == NULL)
-                    return NULL;
+                written = json_serialize_to_buffer_r(temp_value, buf, level+1, is_pretty, num_buf);
+                if (written < 0)
+                    return -1;
+                if (buf != NULL)
+                    buf += written;
+                written_total += written;
                 if (i < (count - 1))
-                    PRINT_AND_SKIP(buf, ",");
+                    APPEND_STRING(",");
+                if (is_pretty)
+                    APPEND_STRING("\n");
             }
-            PRINT_AND_SKIP(buf, "]");
-            return buf;
+            if (count > 0 && is_pretty)
+                APPEND_INDENT(level);
+            APPEND_STRING("]");
+            return written_total;
         case JSONObject:
             object = json_value_get_object(value);
             count  = json_object_get_count(object);
-            PRINT_AND_SKIP(buf, "{");
+            APPEND_STRING("{");
+            if (count > 0 && is_pretty)
+                APPEND_STRING("\n");
             for (i = 0; i < count; i++) {
                 key = json_object_get_name(object, i);
-                buf = json_serialize_string(key, buf);
-                if (buf == NULL)
-                    return NULL;
-                PRINT_AND_SKIP(buf, ":");
+                if (is_pretty)
+                    APPEND_INDENT(level+1);
+                written = json_serialize_string(key, buf);
+                if (written < 0)
+                    return -1;
+                if (buf != NULL)
+                    buf += written;
+                written_total += written;
+                APPEND_STRING(":");
+                if (is_pretty)
+                    APPEND_STRING(" ");
                 temp_value = json_object_get_value(object, key);
-                buf = json_serialize_to_buffer_r(temp_value, buf);
-                if (buf == NULL)
-                    return NULL;
+                written = json_serialize_to_buffer_r(temp_value, buf, level+1, is_pretty, num_buf);
+                if (written < 0)
+                    return -1;
+                if (buf != NULL)
+                    buf += written;
+                written_total += written;
                 if (i < (count - 1))
-                    PRINT_AND_SKIP(buf, ",");
+                    APPEND_STRING(",");
+                if (is_pretty)
+                    APPEND_STRING("\n");
             }
-            PRINT_AND_SKIP(buf, "}");
-            return buf;
+            if (count > 0 && is_pretty)
+                APPEND_INDENT(level);
+            APPEND_STRING("}");
+            return written_total;
         case JSONString:
             string = json_value_get_string(value);
-            buf = json_serialize_string(string, buf);
-            return buf;
+            written = json_serialize_string(string, buf);
+            if (written < 0)
+                return -1;
+            if (buf != NULL)
+                buf += written;
+            written_total += written;
+            return written_total;
         case JSONBoolean:
-            if (json_value_get_boolean(value)) {
-                PRINT_AND_SKIP(buf, "true");
-            } else {
-                PRINT_AND_SKIP(buf, "false");
-            }
-            return buf;
+            if (json_value_get_boolean(value))
+                APPEND_STRING("true");
+            else
+                APPEND_STRING("false");
+            return written_total;
         case JSONNumber:
             num = json_value_get_number(value);
-            if (num == ((double)(int)num)) { /*  check if num is integer */
-                PRINTF_AND_SKIP(buf, "%d", (int)num);
-            } else {
-                PRINTF_AND_SKIP(buf, DOUBLE_SERIALIZATION_FORMAT, num);
-            }
-            return buf;
+            if (buf != NULL)
+                num_buf = buf;
+            if (num == ((double)(int)num)) /*  check if num is integer */
+                written = sprintf(num_buf, "%d", (int)num);
+            else
+                written = sprintf(num_buf, DOUBLE_SERIALIZATION_FORMAT, num);
+            if (written < 0)
+                return -1;
+            if (buf != NULL)
+                buf += written;
+            written_total += written;
+            return written_total;
         case JSONNull:
-            PRINT_AND_SKIP(buf, "null");
-            return buf;
+            APPEND_STRING("null");
+            return written_total;
         case JSONError:
-            return NULL;
+            return -1;
         default:
-            return NULL;
+            return -1;
     }
 }
 
-static char * json_serialize_string(const char *string, char *buf) {
+static int json_serialize_string(const char *string, char *buf) {
     size_t i = 0, len = strlen(string);
     char c = '\0';
-    PRINT_AND_SKIP(buf, "\"")
+    int written = -1, written_total = 0;
+    APPEND_STRING("\"");
     for (i = 0; i < len; i++) {
         c = string[i];
         switch (c) {
-            case '\"': PRINT_AND_SKIP(buf, "\\\"");   break;
-            case '\\': PRINT_AND_SKIP(buf, "\\\\");   break;
-            case '\b': PRINT_AND_SKIP(buf, "\\b");    break;
-            case '\f': PRINT_AND_SKIP(buf, "\\f");    break;
-            case '\n': PRINT_AND_SKIP(buf, "\\n");    break;
-            case '\r': PRINT_AND_SKIP(buf, "\\r");    break;
-            case '\t': PRINT_AND_SKIP(buf, "\\t");    break;
-            default:   PRINTF_AND_SKIP(buf, "%c", c); break;
+            case '\"': APPEND_STRING("\\\""); break;
+            case '\\': APPEND_STRING("\\\\"); break;
+            case '\b': APPEND_STRING("\\b"); break;
+            case '\f': APPEND_STRING("\\f"); break;
+            case '\n': APPEND_STRING("\\n"); break;
+            case '\r': APPEND_STRING("\\r"); break;
+            case '\t': APPEND_STRING("\\t"); break;
+            default:
+                if (buf != NULL) {
+                    buf[0] = c;
+                    buf += 1;
+                }
+                written_total += 1;
+                break;
         }
     }
-    PRINT_AND_SKIP(buf, "\"");
-    return buf;
+    APPEND_STRING("\"");
+    return written_total;
 }
+
+static int append_indent(char *buf, int level) {
+    int i;
+    int written = -1, written_total = 0;
+    for (i = 0; i < level; i++) {
+        APPEND_STRING("    ");
+    }
+    return written_total;
+}
+
+static int append_string(char *buf, const char *string) {
+    if (buf == NULL) {
+        return (int)strlen(string);
+    }
+    return sprintf(buf, "%s", string);
+}
+
+#undef APPEND_STRING
+#undef APPEND_INDENT
 
 /* Parser API */
 JSON_Value * json_parse_file(const char *filename) {
@@ -1204,18 +1211,19 @@ JSON_Value * json_value_deep_copy(const JSON_Value *value) {
 }
 
 size_t json_serialization_size(const JSON_Value *value) {
-    char buf[1100]; /* recursively allocating buffer on stack is a bad idea, so let's do it only once */
-    return json_serialization_size_r(value, buf) + 1;
+    char num_buf[1100]; /* recursively allocating buffer on stack is a bad idea, so let's do it only once */
+    int res = json_serialize_to_buffer_r(value, NULL, 0, 0, num_buf);
+    return res < 0 ? 0 : (size_t)(res + 1);
 }
 
 JSON_Status json_serialize_to_buffer(const JSON_Value *value, char *buf, size_t buf_size_in_bytes) {
-    char *serialization_result = NULL;
+    int written = -1;
     size_t needed_size_in_bytes = json_serialization_size(value);
-    if (buf_size_in_bytes < needed_size_in_bytes) {
+    if (needed_size_in_bytes == 0 || buf_size_in_bytes < needed_size_in_bytes) {
         return JSONFailure;
     }
-    serialization_result = json_serialize_to_buffer_r(value, buf);
-    if(serialization_result == NULL)
+    written = json_serialize_to_buffer_r(value, buf, 0, 0, NULL);
+    if (written < 0)
         return JSONFailure;
     return JSONSuccess;
 }
@@ -1243,7 +1251,11 @@ JSON_Status json_serialize_to_file(const JSON_Value *value, const char *filename
 char * json_serialize_to_string(const JSON_Value *value) {
     JSON_Status serialization_result = JSONFailure;
     size_t buf_size_bytes = json_serialization_size(value);
-    char *buf = (char*)parson_malloc(buf_size_bytes);
+    char *buf = NULL;
+    if (buf_size_bytes == 0) {
+        return NULL;
+    }
+    buf = (char*)parson_malloc(buf_size_bytes);
     if (buf == NULL)
         return NULL;
     serialization_result = json_serialize_to_buffer(value, buf, buf_size_bytes);
@@ -1253,6 +1265,62 @@ char * json_serialize_to_string(const JSON_Value *value) {
     }
     return buf;
 }
+
+size_t json_serialization_size_pretty(const JSON_Value *value) {
+    char num_buf[1100]; /* recursively allocating buffer on stack is a bad idea, so let's do it only once */
+    int res = json_serialize_to_buffer_r(value, NULL, 0, 1, num_buf);
+    return res < 0 ? 0 : (size_t)(res + 1);
+}
+
+JSON_Status json_serialize_to_buffer_pretty(const JSON_Value *value, char *buf, size_t buf_size_in_bytes) {
+    int written = -1;
+    size_t needed_size_in_bytes = json_serialization_size_pretty(value);
+    if (needed_size_in_bytes == 0 || buf_size_in_bytes < needed_size_in_bytes)
+        return JSONFailure;
+    written = json_serialize_to_buffer_r(value, buf, 0, 1, NULL);
+    if (written < 0)
+        return JSONFailure;
+    return JSONSuccess;
+}
+
+JSON_Status json_serialize_to_file_pretty(const JSON_Value *value, const char *filename) {
+    JSON_Status return_code = JSONSuccess;
+    FILE *fp = NULL;
+    char *serialized_string = json_serialize_to_string_pretty(value);
+    if (serialized_string == NULL) {
+        return JSONFailure;
+    }
+    fp = fopen (filename, "w");
+    if (fp != NULL) {
+        if (fputs (serialized_string, fp) == EOF) {
+            return_code = JSONFailure;
+        }
+        if (fclose (fp) == EOF) {
+            return_code = JSONFailure;
+        }
+    }
+    json_free_serialized_string(serialized_string);
+    return return_code;
+}
+
+char * json_serialize_to_string_pretty(const JSON_Value *value) {
+    JSON_Status serialization_result = JSONFailure;
+    size_t buf_size_bytes = json_serialization_size_pretty(value);
+    char *buf = NULL;
+    if (buf_size_bytes == 0) {
+        return NULL;
+    }
+    buf = (char*)parson_malloc(buf_size_bytes);
+    if (buf == NULL)
+        return NULL;
+    serialization_result = json_serialize_to_buffer_pretty(value, buf, buf_size_bytes);
+    if (serialization_result == JSONFailure) {
+        json_free_serialized_string(buf);
+        return NULL;
+    }
+    return buf;
+}
+
 
 void json_free_serialized_string(char *string) {
     parson_free(string);
@@ -1685,8 +1753,7 @@ int json_boolean(const JSON_Value *value) {
     return json_value_get_boolean(value);
 }
 
-void json_set_allocation_functions(JSON_Malloc_Function malloc_fun, JSON_Free_Function free_fun)
-{
+void json_set_allocation_functions(JSON_Malloc_Function malloc_fun, JSON_Free_Function free_fun) {
     parson_malloc = malloc_fun;
     parson_free = free_fun;
 }

@@ -1,6 +1,6 @@
 /*
  Parson ( http://kgabis.github.com/parson/ )
- Copyright (c) 2012 - 2014 Krzysztof Gabis
+ Copyright (c) 2012 - 2015 Krzysztof Gabis
  
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal
@@ -75,11 +75,18 @@ JSON_Value * json_parse_string(const char *string);
 JSON_Value * json_parse_string_with_comments(const char *string);
     
 /* Serialization */
-size_t      json_serialization_size(const JSON_Value *value);
+size_t      json_serialization_size(const JSON_Value *value); /* returns 0 on fail */
 JSON_Status json_serialize_to_buffer(const JSON_Value *value, char *buf, size_t buf_size_in_bytes);
 JSON_Status json_serialize_to_file(const JSON_Value *value, const char *filename);
 char *      json_serialize_to_string(const JSON_Value *value);
-void        json_free_serialized_string(char *string); /* frees string from json_serialize_to_string */
+
+/* Pretty serialization */
+size_t      json_serialization_size_pretty(const JSON_Value *value); /* returns 0 on fail */
+JSON_Status json_serialize_to_buffer_pretty(const JSON_Value *value, char *buf, size_t buf_size_in_bytes);
+JSON_Status json_serialize_to_file_pretty(const JSON_Value *value, const char *filename);
+char *      json_serialize_to_string_pretty(const JSON_Value *value);
+
+void        json_free_serialized_string(char *string); /* frees string from json_serialize_to_string and json_serialize_to_string_pretty */
 
 /* Comparing */
 int  json_value_equals(const JSON_Value *a, const JSON_Value *b);
